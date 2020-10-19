@@ -2,22 +2,9 @@ import os
 import json
 import discord
 from dotenv import load_dotenv
-from discord.ext import commands
-import sched, time, datetime
-
-### Environment Setup ###
-
-load_dotenv()
-# Change these in .env file
-TOKEN = os.getenv('DISCORD_TOKEN')
-FOLDER_PATH = os.getenv('BIRTHDAY_FILE_PATH')
-UTC_OFFSET = int(os.getenv('UTC_TIME_OFFSET_BIRTHDAY'))
-IS_US_TIMEZONE = bool(os.getenv('IS_US_TIMEZONE_BIRTHDAY'))
-if not os.path.isdir(FOLDER_PATH):
-    os.mkdir(FOLDER_PATH)
-
-bot = commands.Bot(command_prefix='b!d ')
-current_scheduler = sched.scheduler(time.time, time.sleep)
+from discord.ext import commands, tasks
+import time, datetime
+import asyncio
 
 ### Helper Functions ###
 
@@ -129,28 +116,23 @@ class USTimeZone(datetime.tzinfo):
             # Daylight savings time
             return dst_time
 
-def schedule_birthdays(birthdays, serverid):
-    """Takes a dictionary of birthdays and a serverid, then schedules a celebrate_birthday call.
-    """
-    if IS_US_TIMEZONE:
-        tz = USTimeZone(UTC_OFFSET)
-    else:
-        tz = datetime.timezone(datetime.timedelta(hours=UTC_OFFSET))
-    for userid in birthdays.keys():
-        birthday_dt = datetime.datetime.fromtimestamp(birthdays[userid]['bday'], tz=tz)
-        year_now = datetime.datetime.now(tz=tz).year
-        upcoming_birthday = birthday_dt.replace(year=year_now)
-        current_scheduler.enterabs(upcoming_birthday.timestamp(), 0, celebrate_birthday, argument=(userid, serverid))
+### Environment Setup ###
 
-async def celebrate_birthday(userid, serverid):
-    """Celebrates a user's message with a nice message in its designated announcements channel.
-    """
-    channel_path = f'{FOLDER_PATH}/announcements.txt'
-    with open(channel_path) as f:
-        channels = json.load(f)
-    channelid = int(channels[str(serverid)])
-    channel = bot.get_channel(channelid)
-    await channel.send(f'🎊 Happy Birthday <@{userid}> 🎊')
+load_dotenv()
+# Change these in .env file
+TOKEN = os.getenv('DISCORD_TOKEN')
+FOLDER_PATH = os.getenv('BIRTHDAY_FILE_PATH')
+if not os.path.isdir(FOLDER_PATH):
+    os.mkdir(FOLDER_PATH)
+
+UTC_OFFSET = int(os.getenv('UTC_TIME_OFFSET_BIRTHDAY'))
+IS_US_TIMEZONE = bool(os.getenv('IS_US_TIMEZONE_BIRTHDAY'))
+if IS_US_TIMEZONE:
+    TIMEZONE = USTimeZone(UTC_OFFSET)
+else:
+    TIMEZONE = datetime.timezone(datetime.timedelta(hours=UTC_OFFSET))
+
+bot = commands.Bot(command_prefix='b!d ')
 
 ### Events ###
 
@@ -175,12 +157,8 @@ async def on_message(message):
 )
 async def set(ctx, message):
     birthday_path = f'{FOLDER_PATH}/{ctx.guild.id}.txt'
-    # Write mode in case we need to make a new file
-    with open(birthday_path, 'w+') as f:
-        try:
-            birthdays = json.load(f)
-        except:
-            birthdays = {}
+    with open(birthday_path) as f:
+        birthdays = json.load(f)
     try:
         date_given = message.split("/")
         assert 2 <= len(date_given) <= 3
@@ -191,9 +169,6 @@ async def set(ctx, message):
         birthday = {'name': ctx.message.author.name, 
                     'bday': dt.replace(tzinfo=datetime.timezone.utc).timestamp()} # Gives a POSIX int timestamp to store, asssuming UTC timezone
         birthdays[str(ctx.message.author.id)] = birthday
-        for event in current_scheduler.queue:
-            current_scheduler.cancel(event)
-        schedule_birthdays(birthdays, ctx.guild.id)
         with open(birthday_path, 'w') as f:
             json.dump(birthdays, f)
         await ctx.channel.send(f"Your birthday has been set to {posixtime_to_str(birthday['bday'])}")
@@ -210,10 +185,8 @@ async def list(ctx):
         with open(birthday_path) as f:
             birthdays = json.load(f)
     except json.decoder.JSONDecodeError:
-        await ctx.channel.send('No birthdays set on this server.')
-        return
-    except:
         # Empty file or file doesn't exist.
+        await ctx.channel.send('No birthdays set on this server.')
         return
     # Birthday (username, day) tuples in different lists for each month.
     birthday_list_month = [[],[],[],[],[],[],[],[],[],[],[],[]]
@@ -248,15 +221,46 @@ async def setchannel(ctx):
         json.dump(channels, f)
     await ctx.channel.send(f"```{ctx.channel.name}``` has been set to the channel for birthday announcements to appear in.")
 
-### Main Runtime ###
+### Tasks ###
+async def celebrate_birthdays(birthdays, serverid):
+    """Takes a birthdays dictionary and a serverid.
+    Returns a user's message with a nice message in its designated announcements channel.
+    """
+    channel_path = f'{FOLDER_PATH}/announcements.txt'
+    with open(channel_path) as f:
+        channels = json.load(f)
+    channelid = int(channels[str(serverid)])
+    channel = bot.get_channel(channelid)
+    now_dt = datetime.datetime.now(tz=TIMEZONE)
+    for userid in birthdays:
+        birthday_dt = datetime.datetime.fromtimestamp(birthdays[userid]['bday'], tz=TIMEZONE)
+        if birthday_dt.month == now_dt.month and birthday_dt.day == now_dt.day:
+            print(f"{userid}'s bday was celebrated")
+            await channel.send(f'🎊 Happy Birthday <@{userid}> 🎊')
 
-# Schedule all existing birthdays in folder
-for filename in os.listdir(FOLDER_PATH):
-    if filename != 'announcements.txt':
-        with open(f'{FOLDER_PATH}/{filename}') as f:
-            try:
-                birthdays = json.load(f)
-            except json.decoder.JSONDecodeError:
-                birthdays = {}
-            schedule_birthdays(birthdays, int(filename[:-4]))
+@tasks.loop(hours=24)
+async def celebrate_all_server_birthdays():
+    """Celebrates every server's birthdays.
+    """
+    for filename in os.listdir(FOLDER_PATH):
+        if filename != 'announcements.txt':
+            with open(f'{FOLDER_PATH}/{filename}') as f:
+                try:
+                    birthdays = json.load(f)
+                except json.decoder.JSONDecodeError:
+                    return
+                serverid = int(filename[:-4])
+                print(f"Celebrating ServerID {serverid}'s birthdays")
+                await celebrate_birthdays(birthdays, serverid)
+
+@celebrate_all_server_birthdays.before_loop
+async def before():
+    await bot.wait_until_ready()
+    now_dt = datetime.datetime.now(tz=TIMEZONE)
+    print("WE WOKE UP at {0}:{1}:{2} on {3} {4}, {5} (In the set Timezone)".format(now_dt.hour, now_dt.minute, now_dt.second, now_dt.month, now_dt.day, now_dt.year))
+    # Want to execute at 12:01 AM the next day.
+    midnight_dt = (now_dt + datetime.timedelta(day=1)).replace(hour=0, minute=1, second=0)
+    await asyncio.sleep(midnight_dt.timestamp() - time.time())
+
+celebrate_all_server_birthdays.start()        
 bot.run(TOKEN)
