@@ -37,7 +37,7 @@ async def on_message(message):
         return
     else:
         await bot.process_commands(message)
-        if message.content == 'b!d':
+        if message.content == 'b!d' or message.content == 'b!d set':
             await message.channel.send("**So silly.** Do b!d help for help.")
 
 ### Commands ###
@@ -48,8 +48,6 @@ async def on_message(message):
 )
 async def set(ctx, message):
     birthday_path = f'{FOLDER_PATH}/{ctx.guild.id}.txt'
-    with open(birthday_path) as f:
-        birthdays = json.load(f)
     try:
         date_given = message.split("/")
         assert 2 <= len(date_given) <= 3
@@ -59,6 +57,8 @@ async def set(ctx, message):
         dt = datetime.datetime(year, month, day)
         birthday = {'name': ctx.message.author.name, 
                     'bday': dt.replace(tzinfo=datetime.timezone.utc).timestamp()} # Gives a POSIX int timestamp to store, asssuming UTC timezone
+        with open(birthday_path) as f:
+            birthdays = json.load(f)
         birthdays[str(ctx.message.author.id)] = birthday
         with open(birthday_path, 'w') as f:
             json.dump(birthdays, f)
